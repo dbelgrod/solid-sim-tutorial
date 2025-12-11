@@ -2,7 +2,7 @@
 import numpy as np  # numpy for linear algebra
 import taichi as ti # taichi for fast and parallelized computation 
 
-ti.init(arch=ti.cpu)
+ti.init(arch=ti.metal, fast_math=True)
 
 # ANCHOR: property_def
 # simulation setup
@@ -12,7 +12,7 @@ dt = 2e-4 # time step size in second
 ppc = 8 # average particles per cell
 
 density = 1000 # mass density, unit: kg / m^3
-E, nu = 1e4, 0.3 # block's Young's modulus and Poisson's ratio
+E, nu = 1e4, 0.3 # block's Young's modulus and Poisson's ratio (original: 1e4)
 mu, lam = E / (2 * (1 + nu)), E * nu / ((1 + nu) * (1 - 2 * nu)) # Lame parameters
 # ANCHOR_END: property_def
 
@@ -26,8 +26,8 @@ box1_samples = uniform_grid(0.2, 0.4, 0.4, 0.6, dx / np.sqrt(ppc))
 box1_velocities = np.tile(np.array([10.0, 0]), (len(box1_samples), 1))
 box2_samples = uniform_grid(0.6, 0.4, 0.8, 0.6, dx / np.sqrt(ppc))
 box2_velocities = np.tile(np.array([-10.0, 0]), (len(box1_samples), 1))
-all_samples = np.concatenate([box1_samples, box2_samples], axis=0)
-all_velocities = np.concatenate([box1_velocities, box2_velocities], axis=0)
+all_samples = np.concatenate([box1_samples, box2_samples], axis=0).astype(np.float32)
+all_velocities = np.concatenate([box1_velocities, box2_velocities], axis=0).astype(np.float32)
 # ANCHOR_END: setting
 
 # ANCHOR: data_def
@@ -42,7 +42,7 @@ vol.fill(0.2 * 0.4 / N_particles) # get the volume of each particle as V_rest / 
 m = ti.field(float, N_particles)           # the mass of particle
 m.fill(vol[0] * density)
 F = ti.Matrix.field(2, 2, float, N_particles)  # the deformation gradient of particles
-F.from_numpy(np.tile(np.eye(2), (N_particles, 1, 1)))
+F.from_numpy(np.tile(np.eye(2), (N_particles, 1, 1)).astype(np.float32))
 
 # grid data
 grid_m = ti.field(float, (grid_size, grid_size))
@@ -50,10 +50,12 @@ grid_v = ti.Vector.field(2, float, (grid_size, grid_size))
 # ANCHOR_END: data_def
 
 # ANCHOR: reset_grid
+@ti.kernel
 def reset_grid():
     # after each transfer, the grid is reset
-    grid_m.fill(0)
-    grid_v.fill(0)
+    for i, j in grid_m:
+        grid_m[i, j] = 0
+        grid_v[i, j] = ti.Vector.zero(float, 2)
 # ANCHOR_END: reset_grid
 
 ################################
@@ -72,6 +74,7 @@ def StVK_Hencky_PK1_2D(F):
 # ANCHOR: p2g
 @ti.kernel
 def particle_to_grid_transfer():
+    ti.block_local(grid_m, grid_v)
     for p in range(N_particles):
         base = (x[p] / dx - 0.5).cast(int)
         fx = x[p] / dx - base.cast(float)
@@ -134,16 +137,9 @@ def grid_to_particle_transfer():
                 v_grad_wT += grid_v[base + offset].outer_product(grad_weight)
 
         v[p] = new_v
+        x[p] += dt * new_v  # advection (merged from update_particle_state)
         F[p] = (ti.Matrix.identity(float, 2) + dt * v_grad_wT) @ F[p]
 # ANCHOR_END: g2p
-
-# Deformation Gradient and Particle State Update
-# ANCHOR: particle_update
-@ti.kernel
-def update_particle_state():
-    for p in range(N_particles):
-        x[p] += dt * v[p] # advection
-# ANCHOR_END: particle_update
 
 # ANCHOR: time_step
 def step():
@@ -152,7 +148,6 @@ def step():
     particle_to_grid_transfer()
     update_grid()
     grid_to_particle_transfer()
-    update_particle_state()
 # ANCHOR_END: time_step
 
 ################################
